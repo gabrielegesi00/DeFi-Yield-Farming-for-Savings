@@ -6,6 +6,15 @@
 (define-constant ERR-INVALID-AMOUNT (err u6))
 (define-constant ERR-COOLDOWN-ACTIVE (err u7))
 (define-constant ERR-POOL-INACTIVE (err u8))
+(define-constant ERR-MULTIPLIER-NOT-FOUND (err u9))
+
+(define-constant MULTIPLIER-BASE u10000)
+(define-constant TIER-1-BLOCKS u1440)
+(define-constant TIER-2-BLOCKS u4320)
+(define-constant TIER-3-BLOCKS u8640)
+(define-constant TIER-1-MULTIPLIER u11000)
+(define-constant TIER-2-MULTIPLIER u12500)
+(define-constant TIER-3-MULTIPLIER u15000)
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var total-pools uint u0)
@@ -38,6 +47,15 @@
   { count: uint }
 )
 
+(define-map user-multipliers
+  { user: principal, pool-id: uint }
+  {
+    current-tier: uint,
+    last-tier-update: uint,
+    accumulated-multiplier: uint
+  }
+)
+
 (define-private (get-pool (pool-id uint))
   (map-get? pools { pool-id: pool-id })
 )
@@ -61,6 +79,40 @@
   )
 )
 
+(define-private (get-multiplier-tier (blocks-staked uint))
+  (if (>= blocks-staked TIER-3-BLOCKS)
+    u3
+    (if (>= blocks-staked TIER-2-BLOCKS)
+      u2
+      (if (>= blocks-staked TIER-1-BLOCKS)
+        u1
+        u0
+      )
+    )
+  )
+)
+
+(define-private (get-tier-multiplier (tier uint))
+  (if (is-eq tier u3)
+    TIER-3-MULTIPLIER
+    (if (is-eq tier u2)
+      TIER-2-MULTIPLIER
+      (if (is-eq tier u1)
+        TIER-1-MULTIPLIER
+        MULTIPLIER-BASE
+      )
+    )
+  )
+)
+
+(define-private (calculate-multiplied-rewards (base-rewards uint) (multiplier uint))
+  (/ (* base-rewards multiplier) MULTIPLIER-BASE)
+)
+
+(define-private (get-user-multiplier (user principal) (pool-id uint))
+  (map-get? user-multipliers { user: user, pool-id: pool-id })
+)
+
 (define-read-only (get-pool-info (pool-id uint))
   (get-pool pool-id)
 )
@@ -74,10 +126,18 @@
     stake-info (let
       (
         (blocks-since-claim (get-blocks-elapsed (get last-claim stake-info)))
+        (blocks-staked (get-blocks-elapsed (get stake-time stake-info)))
         (amount (get amount stake-info))
+        (current-tier (get-multiplier-tier blocks-staked))
+        (multiplier (get-tier-multiplier current-tier))
       )
       (match (get-pool pool-id)
-        pool-info (ok (calculate-rewards amount (get reward-rate pool-info) blocks-since-claim))
+        pool-info (let
+          (
+            (base-rewards (calculate-rewards amount (get reward-rate pool-info) blocks-since-claim))
+          )
+          (ok (calculate-multiplied-rewards base-rewards multiplier))
+        )
         (err ERR-POOL-NOT-FOUND)
       )
     )
@@ -94,6 +154,32 @@
     total-pools: (var-get total-pools),
     emergency-shutdown: (var-get emergency-shutdown),
     contract-owner: (var-get contract-owner)
+  }
+)
+
+(define-read-only (get-user-multiplier-info (user principal) (pool-id uint))
+  (get-user-multiplier user pool-id)
+)
+
+(define-read-only (get-current-multiplier (user principal) (pool-id uint))
+  (match (get-user-stake user pool-id)
+    stake-info (let
+      (
+        (blocks-staked (get-blocks-elapsed (get stake-time stake-info)))
+        (current-tier (get-multiplier-tier blocks-staked))
+      )
+      (ok (get-tier-multiplier current-tier))
+    )
+    (err ERR-NOT-STAKED)
+  )
+)
+
+(define-read-only (get-multiplier-tiers)
+  {
+    base-multiplier: MULTIPLIER-BASE,
+    tier-1: { blocks: TIER-1-BLOCKS, multiplier: TIER-1-MULTIPLIER },
+    tier-2: { blocks: TIER-2-BLOCKS, multiplier: TIER-2-MULTIPLIER },
+    tier-3: { blocks: TIER-3-BLOCKS, multiplier: TIER-3-MULTIPLIER }
   }
 )
 
@@ -143,6 +229,14 @@
             total-rewards: u0
           }
         )
+        (map-set user-multipliers
+          { user: tx-sender, pool-id: pool-id }
+          {
+            current-tier: u0,
+            last-tier-update: stacks-block-height,
+            accumulated-multiplier: MULTIPLIER-BASE
+          }
+        )
         (map-set pools
           { pool-id: pool-id }
           (merge pool-info { total-staked: (+ (get total-staked pool-info) amount) })
@@ -172,7 +266,11 @@
           pool-info (let
             (
               (blocks-elapsed (get-blocks-elapsed (get last-claim stake-info)))
-              (rewards (calculate-rewards (get amount stake-info) (get reward-rate pool-info) blocks-elapsed))
+              (blocks-staked (get-blocks-elapsed (get stake-time stake-info)))
+              (current-tier (get-multiplier-tier blocks-staked))
+              (multiplier (get-tier-multiplier current-tier))
+              (base-rewards (calculate-rewards (get amount stake-info) (get reward-rate pool-info) blocks-elapsed))
+              (rewards (calculate-multiplied-rewards base-rewards multiplier))
             )
             (if (> rewards u0)
               (begin
@@ -183,6 +281,14 @@
                     last-claim: stacks-block-height,
                     total-rewards: (+ (get total-rewards stake-info) rewards)
                   })
+                )
+                (map-set user-multipliers
+                  { user: tx-sender, pool-id: pool-id }
+                  {
+                    current-tier: current-tier,
+                    last-tier-update: stacks-block-height,
+                    accumulated-multiplier: multiplier
+                  }
                 )
                 (ok rewards)
               )
@@ -205,11 +311,16 @@
           pool-info (let
             (
               (blocks-elapsed (get-blocks-elapsed (get last-claim stake-info)))
-              (rewards (calculate-rewards (get amount stake-info) (get reward-rate pool-info) blocks-elapsed))
+              (blocks-staked (get-blocks-elapsed (get stake-time stake-info)))
+              (current-tier (get-multiplier-tier blocks-staked))
+              (multiplier (get-tier-multiplier current-tier))
+              (base-rewards (calculate-rewards (get amount stake-info) (get reward-rate pool-info) blocks-elapsed))
+              (rewards (calculate-multiplied-rewards base-rewards multiplier))
               (total-return (+ (get amount stake-info) rewards))
             )
             (try! (as-contract (stx-transfer? total-return tx-sender tx-sender)))
             (map-delete user-stakes { user: tx-sender, pool-id: pool-id })
+            (map-delete user-multipliers { user: tx-sender, pool-id: pool-id })
             (map-set pools
               { pool-id: pool-id }
               (merge pool-info { total-staked: (- (get total-staked pool-info) (get amount stake-info)) })
