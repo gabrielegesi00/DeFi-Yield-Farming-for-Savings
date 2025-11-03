@@ -7,6 +7,8 @@
 (define-constant ERR-COOLDOWN-ACTIVE (err u7))
 (define-constant ERR-POOL-INACTIVE (err u8))
 (define-constant ERR-MULTIPLIER-NOT-FOUND (err u9))
+(define-constant ERR-TOTAL-CAP-EXCEEDED (err u10))
+(define-constant ERR-PER-USER-CAP-EXCEEDED (err u11))
 
 (define-constant MULTIPLIER-BASE u10000)
 (define-constant TIER-1-BLOCKS u1440)
@@ -29,6 +31,14 @@
     reward-rate: uint,
     min-stake: uint,
     created-at: uint
+  }
+)
+
+(define-map pool-limits
+  { pool-id: uint }
+  {
+    max-total: (optional uint),
+    max-per-user: (optional uint)
   }
 )
 
@@ -115,6 +125,10 @@
 
 (define-read-only (get-pool-info (pool-id uint))
   (get-pool pool-id)
+)
+
+(define-read-only (get-pool-limits (pool-id uint))
+  (map-get? pool-limits { pool-id: pool-id })
 )
 
 (define-read-only (get-user-stake-info (user principal) (pool-id uint))
@@ -219,6 +233,20 @@
         (asserts! (get active pool-info) ERR-POOL-INACTIVE)
         (asserts! (>= amount (get min-stake pool-info)) ERR-INVALID-AMOUNT)
         (asserts! (is-none (get-user-stake tx-sender pool-id)) ERR-ALREADY-STAKED)
+        (match (map-get? pool-limits { pool-id: pool-id })
+          limits (begin
+            (match (get max-total limits)
+              mt (begin (asserts! (<= (+ (get total-staked pool-info) amount) mt) ERR-TOTAL-CAP-EXCEEDED) true)
+              true
+            )
+            (match (get max-per-user limits)
+              mp (begin (asserts! (<= amount mp) ERR-PER-USER-CAP-EXCEEDED) true)
+              true
+            )
+            true
+          )
+          true
+        )
         (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
         (map-set user-stakes
           { user: tx-sender, pool-id: pool-id }
@@ -357,6 +385,19 @@
           (merge pool-info { active: (not (get active pool-info)) })
         )
         (ok (not (get active pool-info)))
+      )
+      ERR-POOL-NOT-FOUND
+    )
+  )
+)
+
+(define-public (set-pool-limits (pool-id uint) (max-total (optional uint)) (max-per-user (optional uint)))
+  (begin
+    (asserts! (is-contract-owner) ERR-UNAUTHORIZED)
+    (match (get-pool pool-id)
+      pool-info (begin
+        (map-set pool-limits { pool-id: pool-id } { max-total: max-total, max-per-user: max-per-user })
+        (ok true)
       )
       ERR-POOL-NOT-FOUND
     )
