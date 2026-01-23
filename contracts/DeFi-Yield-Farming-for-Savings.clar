@@ -9,6 +9,9 @@
 (define-constant ERR-MULTIPLIER-NOT-FOUND (err u9))
 (define-constant ERR-TOTAL-CAP-EXCEEDED (err u10))
 (define-constant ERR-PER-USER-CAP-EXCEEDED (err u11))
+(define-constant ERR-SELF-REFERRAL (err u12))
+(define-constant ERR-ALREADY-REFERRED (err u13))
+(define-constant ERR-NO-REFERRER (err u14))
 
 (define-constant MULTIPLIER-BASE u10000)
 (define-constant TIER-1-BLOCKS u1440)
@@ -17,6 +20,8 @@
 (define-constant TIER-1-MULTIPLIER u11000)
 (define-constant TIER-2-MULTIPLIER u12500)
 (define-constant TIER-3-MULTIPLIER u15000)
+(define-constant REFERRAL-BONUS-PERCENT u500)
+(define-constant REFEREE-BONUS-PERCENT u300)
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var total-pools uint u0)
@@ -63,6 +68,19 @@
     current-tier: uint,
     last-tier-update: uint,
     accumulated-multiplier: uint
+  }
+)
+
+(define-map referrals
+  { user: principal }
+  { referrer: principal }
+)
+
+(define-map referral-stats
+  { user: principal }
+  {
+    total-referrals: uint,
+    total-bonus-earned: uint
   }
 )
 
@@ -194,6 +212,24 @@
     tier-1: { blocks: TIER-1-BLOCKS, multiplier: TIER-1-MULTIPLIER },
     tier-2: { blocks: TIER-2-BLOCKS, multiplier: TIER-2-MULTIPLIER },
     tier-3: { blocks: TIER-3-BLOCKS, multiplier: TIER-3-MULTIPLIER }
+  }
+)
+
+(define-read-only (get-referrer (user principal))
+  (map-get? referrals { user: user })
+)
+
+(define-read-only (get-referral-stats (user principal))
+  (default-to 
+    { total-referrals: u0, total-bonus-earned: u0 }
+    (map-get? referral-stats { user: user })
+  )
+)
+
+(define-read-only (get-referral-bonus-rates)
+  {
+    referrer-bonus: REFERRAL-BONUS-PERCENT,
+    referee-bonus: REFEREE-BONUS-PERCENT
   }
 )
 
@@ -430,4 +466,71 @@
 
 (define-public (fund-contract)
   (stx-transfer? u1000000 tx-sender (as-contract tx-sender))
+)
+
+(define-public (register-referral (referrer principal))
+  (begin
+    (asserts! (not (is-eq tx-sender referrer)) ERR-SELF-REFERRAL)
+    (asserts! (is-none (map-get? referrals { user: tx-sender })) ERR-ALREADY-REFERRED)
+    (map-set referrals { user: tx-sender } { referrer: referrer })
+    (let
+      (
+        (current-stats (get-referral-stats referrer))
+      )
+      (map-set referral-stats
+        { user: referrer }
+        {
+          total-referrals: (+ (get total-referrals current-stats) u1),
+          total-bonus-earned: (get total-bonus-earned current-stats)
+        }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (claim-referral-bonus (pool-id uint))
+  (begin
+    (asserts! (not (var-get emergency-shutdown)) ERR-POOL-INACTIVE)
+    (match (get-user-stake tx-sender pool-id)
+      stake-info (match (map-get? referrals { user: tx-sender })
+        ref-info (match (get-pool pool-id)
+          pool-info (let
+            (
+              (blocks-elapsed (get-blocks-elapsed (get last-claim stake-info)))
+              (base-rewards (calculate-rewards (get amount stake-info) (get reward-rate pool-info) blocks-elapsed))
+              (referee-bonus (/ (* base-rewards REFEREE-BONUS-PERCENT) MULTIPLIER-BASE))
+              (referrer-bonus (/ (* base-rewards REFERRAL-BONUS-PERCENT) MULTIPLIER-BASE))
+              (referrer (get referrer ref-info))
+              (referrer-stats (get-referral-stats referrer))
+            )
+            (if (> referee-bonus u0)
+              (begin
+                (try! (as-contract (stx-transfer? referee-bonus tx-sender tx-sender)))
+                (if (> referrer-bonus u0)
+                  (begin
+                    (try! (as-contract (stx-transfer? referrer-bonus tx-sender referrer)))
+                    (map-set referral-stats
+                      { user: referrer }
+                      {
+                        total-referrals: (get total-referrals referrer-stats),
+                        total-bonus-earned: (+ (get total-bonus-earned referrer-stats) referrer-bonus)
+                      }
+                    )
+                    true
+                  )
+                  true
+                )
+                (ok { referee-bonus: referee-bonus, referrer-bonus: referrer-bonus })
+              )
+              (ok { referee-bonus: u0, referrer-bonus: u0 })
+            )
+          )
+          ERR-POOL-NOT-FOUND
+        )
+        ERR-NO-REFERRER
+      )
+      ERR-NOT-STAKED
+    )
+  )
 )
