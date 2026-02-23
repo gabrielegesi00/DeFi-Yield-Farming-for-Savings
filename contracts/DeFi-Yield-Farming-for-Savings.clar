@@ -12,6 +12,7 @@
 (define-constant ERR-SELF-REFERRAL (err u12))
 (define-constant ERR-ALREADY-REFERRED (err u13))
 (define-constant ERR-NO-REFERRER (err u14))
+(define-constant ERR-BELOW-MIN-STAKE (err u15))
 
 (define-constant MULTIPLIER-BASE u10000)
 (define-constant TIER-1-BLOCKS u1440)
@@ -402,6 +403,77 @@
               )
             )
             (ok { amount: (get amount stake-info), rewards: rewards })
+          )
+          ERR-POOL-NOT-FOUND
+        )
+      )
+      ERR-NOT-STAKED
+    )
+  )
+)
+
+(define-public (partial-withdraw (pool-id uint) (withdraw-amount uint))
+  (begin
+    (asserts! (not (var-get emergency-shutdown)) ERR-POOL-INACTIVE)
+    (asserts! (> withdraw-amount u0) ERR-INVALID-AMOUNT)
+    (match (get-user-stake tx-sender pool-id)
+      stake-info (begin
+        (asserts! (<= withdraw-amount (get amount stake-info)) ERR-INSUFFICIENT-BALANCE)
+        (match (get-pool pool-id)
+          pool-info (let
+            (
+              (remaining (- (get amount stake-info) withdraw-amount))
+              (blocks-elapsed (get-blocks-elapsed (get last-claim stake-info)))
+              (blocks-staked (get-blocks-elapsed (get stake-time stake-info)))
+              (current-tier (get-multiplier-tier blocks-staked))
+              (multiplier (get-tier-multiplier current-tier))
+              (base-rewards (calculate-rewards (get amount stake-info) (get reward-rate pool-info) blocks-elapsed))
+              (rewards (calculate-multiplied-rewards base-rewards multiplier))
+              (payout (+ withdraw-amount rewards))
+            )
+            (asserts! (or (is-eq remaining u0) (>= remaining (get min-stake pool-info))) ERR-BELOW-MIN-STAKE)
+            (try! (as-contract (stx-transfer? payout tx-sender tx-sender)))
+            (if (is-eq remaining u0)
+              (begin
+                (map-delete user-stakes { user: tx-sender, pool-id: pool-id })
+                (map-delete user-multipliers { user: tx-sender, pool-id: pool-id })
+                (let
+                  (
+                    (current-count (get-total-user-stakes tx-sender))
+                  )
+                  (if (> current-count u1)
+                    (map-set user-pool-count
+                      { user: tx-sender }
+                      { count: (- current-count u1) }
+                    )
+                    (map-delete user-pool-count { user: tx-sender })
+                  )
+                )
+              )
+              (begin
+                (map-set user-stakes
+                  { user: tx-sender, pool-id: pool-id }
+                  (merge stake-info {
+                    amount: remaining,
+                    last-claim: stacks-block-height,
+                    total-rewards: (+ (get total-rewards stake-info) rewards)
+                  })
+                )
+                (map-set user-multipliers
+                  { user: tx-sender, pool-id: pool-id }
+                  {
+                    current-tier: current-tier,
+                    last-tier-update: stacks-block-height,
+                    accumulated-multiplier: multiplier
+                  }
+                )
+              )
+            )
+            (map-set pools
+              { pool-id: pool-id }
+              (merge pool-info { total-staked: (- (get total-staked pool-info) withdraw-amount) })
+            )
+            (ok { withdrawn: withdraw-amount, rewards-claimed: rewards, remaining-stake: remaining })
           )
           ERR-POOL-NOT-FOUND
         )
