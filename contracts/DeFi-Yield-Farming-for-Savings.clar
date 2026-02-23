@@ -14,6 +14,7 @@
 (define-constant ERR-NO-REFERRER (err u14))
 (define-constant ERR-BELOW-MIN-STAKE (err u15))
 (define-constant ERR-NOTHING-TO-COMPOUND (err u16))
+(define-constant ERR-SAME-REWARD-RATE (err u17))
 
 (define-constant MULTIPLIER-BASE u10000)
 (define-constant TIER-1-BLOCKS u1440)
@@ -80,6 +81,20 @@
     compound-count: uint,
     last-compound: uint
   }
+)
+
+(define-map reward-rate-history
+  { pool-id: uint, change-id: uint }
+  {
+    old-rate: uint,
+    new-rate: uint,
+    changed-at: uint
+  }
+)
+
+(define-map pool-rate-change-count
+  { pool-id: uint }
+  { count: uint }
 )
 
 (define-map referrals
@@ -249,6 +264,14 @@
     { total-compounded: u0, compound-count: u0, last-compound: u0 }
     (map-get? compound-history { user: user, pool-id: pool-id })
   )
+)
+
+(define-read-only (get-rate-change-count (pool-id uint))
+  (default-to u0 (get count (map-get? pool-rate-change-count { pool-id: pool-id })))
+)
+
+(define-read-only (get-rate-change (pool-id uint) (change-id uint))
+  (map-get? reward-rate-history { pool-id: pool-id, change-id: change-id })
 )
 
 (define-public (create-pool (name (string-ascii 50)) (reward-rate uint) (min-stake uint))
@@ -564,6 +587,41 @@
         ERR-POOL-NOT-FOUND
       )
       ERR-NOT-STAKED
+    )
+  )
+)
+
+(define-public (update-reward-rate (pool-id uint) (new-rate uint))
+  (begin
+    (asserts! (is-contract-owner) ERR-UNAUTHORIZED)
+    (asserts! (> new-rate u0) ERR-INVALID-AMOUNT)
+    (match (get-pool pool-id)
+      pool-info (let
+        (
+          (old-rate (get reward-rate pool-info))
+          (change-count (get-rate-change-count pool-id))
+          (new-change-id (+ change-count u1))
+        )
+        (asserts! (not (is-eq old-rate new-rate)) ERR-SAME-REWARD-RATE)
+        (map-set pools
+          { pool-id: pool-id }
+          (merge pool-info { reward-rate: new-rate })
+        )
+        (map-set reward-rate-history
+          { pool-id: pool-id, change-id: new-change-id }
+          {
+            old-rate: old-rate,
+            new-rate: new-rate,
+            changed-at: stacks-block-height
+          }
+        )
+        (map-set pool-rate-change-count
+          { pool-id: pool-id }
+          { count: new-change-id }
+        )
+        (ok { pool-id: pool-id, old-rate: old-rate, new-rate: new-rate })
+      )
+      ERR-POOL-NOT-FOUND
     )
   )
 )
