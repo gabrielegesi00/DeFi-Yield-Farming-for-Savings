@@ -13,6 +13,7 @@
 (define-constant ERR-ALREADY-REFERRED (err u13))
 (define-constant ERR-NO-REFERRER (err u14))
 (define-constant ERR-BELOW-MIN-STAKE (err u15))
+(define-constant ERR-NOTHING-TO-COMPOUND (err u16))
 
 (define-constant MULTIPLIER-BASE u10000)
 (define-constant TIER-1-BLOCKS u1440)
@@ -69,6 +70,15 @@
     current-tier: uint,
     last-tier-update: uint,
     accumulated-multiplier: uint
+  }
+)
+
+(define-map compound-history
+  { user: principal, pool-id: uint }
+  {
+    total-compounded: uint,
+    compound-count: uint,
+    last-compound: uint
   }
 )
 
@@ -232,6 +242,13 @@
     referrer-bonus: REFERRAL-BONUS-PERCENT,
     referee-bonus: REFEREE-BONUS-PERCENT
   }
+)
+
+(define-read-only (get-compound-history (user principal) (pool-id uint))
+  (default-to
+    { total-compounded: u0, compound-count: u0, last-compound: u0 }
+    (map-get? compound-history { user: user, pool-id: pool-id })
+  )
 )
 
 (define-public (create-pool (name (string-ascii 50)) (reward-rate uint) (min-stake uint))
@@ -477,6 +494,74 @@
           )
           ERR-POOL-NOT-FOUND
         )
+      )
+      ERR-NOT-STAKED
+    )
+  )
+)
+
+(define-public (compound-rewards (pool-id uint))
+  (begin
+    (asserts! (not (var-get emergency-shutdown)) ERR-POOL-INACTIVE)
+    (match (get-user-stake tx-sender pool-id)
+      stake-info (match (get-pool pool-id)
+        pool-info (let
+          (
+            (blocks-elapsed (get-blocks-elapsed (get last-claim stake-info)))
+            (blocks-staked (get-blocks-elapsed (get stake-time stake-info)))
+            (current-tier (get-multiplier-tier blocks-staked))
+            (multiplier (get-tier-multiplier current-tier))
+            (base-rewards (calculate-rewards (get amount stake-info) (get reward-rate pool-info) blocks-elapsed))
+            (rewards (calculate-multiplied-rewards base-rewards multiplier))
+            (new-amount (+ (get amount stake-info) rewards))
+            (history (get-compound-history tx-sender pool-id))
+          )
+          (asserts! (> rewards u0) ERR-NOTHING-TO-COMPOUND)
+          (match (map-get? pool-limits { pool-id: pool-id })
+            limits (begin
+              (match (get max-total limits)
+                mt (begin (asserts! (<= (+ (get total-staked pool-info) rewards) mt) ERR-TOTAL-CAP-EXCEEDED) true)
+                true
+              )
+              (match (get max-per-user limits)
+                mp (begin (asserts! (<= new-amount mp) ERR-PER-USER-CAP-EXCEEDED) true)
+                true
+              )
+              true
+            )
+            true
+          )
+          (map-set user-stakes
+            { user: tx-sender, pool-id: pool-id }
+            (merge stake-info {
+              amount: new-amount,
+              last-claim: stacks-block-height,
+              total-rewards: (+ (get total-rewards stake-info) rewards)
+            })
+          )
+          (map-set user-multipliers
+            { user: tx-sender, pool-id: pool-id }
+            {
+              current-tier: current-tier,
+              last-tier-update: stacks-block-height,
+              accumulated-multiplier: multiplier
+            }
+          )
+          (map-set pools
+            { pool-id: pool-id }
+            (merge pool-info { total-staked: (+ (get total-staked pool-info) rewards) })
+          )
+          (map-set compound-history
+            { user: tx-sender, pool-id: pool-id }
+            {
+              total-compounded: (+ (get total-compounded history) rewards),
+              compound-count: (+ (get compound-count history) u1),
+              last-compound: stacks-block-height
+            }
+          )
+          (ok { compounded: rewards, new-stake: new-amount })
+        )
+        ERR-POOL-NOT-FOUND
       )
       ERR-NOT-STAKED
     )
